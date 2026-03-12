@@ -18,12 +18,10 @@ function fmtBRL(v) {
   return Number(v).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
 }
 function fmtDate(d) {
-  const dd = String(d.getDate()).padStart(2, '0');
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  return `${dd}/${mm}/${d.getFullYear()}`;
+  return `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;
 }
 function fmtMonthYear(d) {
-  return `${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
+  return `${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;
 }
 function fmtDateExtenso(d) {
   const meses = ['janeiro','fevereiro','março','abril','maio','junho','julho','agosto','setembro','outubro','novembro','dezembro'];
@@ -35,73 +33,88 @@ app.get('/health', (req, res) => res.json({ ok: true }));
 // Endpoint legado: recebe DOCX via multipart e converte para PDF
 app.post('/convert', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Arquivo nao enviado' });
-  console.log(`[convert] arquivo recebido: ${req.file.originalname}, tamanho: ${req.file.size} bytes`);
+  console.log(`[convert] recebido: ${req.file.originalname}, ${req.file.size} bytes`);
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'docx-'));
   const inputPath = path.join(tmpDir, 'input.docx');
   const outputPath = path.join(tmpDir, 'input.pdf');
   try {
     fs.writeFileSync(inputPath, req.file.buffer);
     const stdout = execSync(
-      'libreoffice --headless --norestore --nofirststartwizard -env:UserInstallation=file://' + tmpDir + '/lo-profile --convert-to pdf --outdir ' + tmpDir + ' ' + inputPath,
+      `libreoffice --headless --norestore --nofirststartwizard -env:UserInstallation=file://${tmpDir}/lo-profile --convert-to pdf --outdir ${tmpDir} ${inputPath}`,
       { timeout: 60000, stdio: 'pipe' }
     );
     console.log('[convert] stdout:', stdout?.toString());
-    const tmpFiles = fs.readdirSync(tmpDir);
     if (!fs.existsSync(outputPath)) {
-      return res.status(500).json({ error: 'Conversao falhou', stdout: stdout?.toString(), files: tmpFiles });
+      return res.status(500).json({ error: 'Conversao falhou', stdout: stdout?.toString(), files: fs.readdirSync(tmpDir) });
     }
     const pdfBuffer = fs.readFileSync(outputPath);
     res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': 'attachment; filename=contrato.pdf' });
     res.send(pdfBuffer);
   } catch (err) {
-    console.error('[convert] ERRO:', err.message);
-    console.error('[convert] stderr:', err.stderr?.toString());
+    console.error('[convert] ERRO:', err.message, err.stderr?.toString());
     res.status(500).json({ error: 'Conversao falhou', detail: err.message, stderr: err.stderr?.toString() });
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
 
-// Endpoint principal: recebe company_id + token, busca dados no Supabase, gera DOCX e converte para PDF
+// Endpoint principal: aceita { data, safeName, token } (Lovable) ou { company_id, token } (legado DB)
 app.post('/generate-pdf', async (req, res) => {
-  console.log('[generate-pdf] body:', JSON.stringify(req.body));
-  const { company_id, token } = req.body || {};
+  console.log('[generate-pdf] body keys:', Object.keys(req.body || {}));
+  const { data: directData, safeName, company_id, token } = req.body || {};
 
-  if (!company_id) return res.status(400).json({ error: 'company_id é obrigatório' });
-  if (!token)      return res.status(400).json({ error: 'token é obrigatório' });
+  if (!token) return res.status(400).json({ error: 'token é obrigatório' });
   if (!SUPABASE_URL || !SERVICE_KEY) {
     return res.status(500).json({ error: 'SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY não configurados' });
   }
 
-  // 1. Busca dados do contrato no Supabase usando o token do usuário (RLS aplicado)
-  console.log('[generate-pdf] Buscando contrato:', company_id);
-  let contract;
-  try {
-    const dbRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/service_contracts?id=eq.${company_id}&select=razao_social,cnpj_cpf,endereco,representante_legal,cpf_representante,valor_honorario,regime_tributario,qtd_empregados,qtd_pro_labore,faturamento_limite,qtd_nfe_mes`,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          apikey: SERVICE_KEY,
-          Accept: 'application/json',
-        },
+  let templateData = directData;
+  let pdfSafeName = safeName;
+
+  // Se não veio data diretamente, busca no Supabase pelo company_id
+  if (!templateData) {
+    if (!company_id) return res.status(400).json({ error: 'data ou company_id é obrigatório' });
+
+    console.log('[generate-pdf] Buscando contrato:', company_id);
+    let contract;
+    try {
+      const dbRes = await fetch(
+        `${SUPABASE_URL}/rest/v1/service_contracts?id=eq.${company_id}&select=razao_social,cnpj_cpf,endereco,representante_legal,cpf_representante,valor_honorario,regime_tributario,qtd_empregados,qtd_pro_labore,faturamento_limite,qtd_nfe_mes`,
+        { headers: { Authorization: `Bearer ${token}`, apikey: SERVICE_KEY, Accept: 'application/json' } }
+      );
+      if (!dbRes.ok) {
+        const t = await dbRes.text();
+        return res.status(500).json({ error: 'Erro ao buscar contrato', detail: t });
       }
-    );
-    if (!dbRes.ok) {
-      const t = await dbRes.text();
-      console.error('[generate-pdf] Erro DB:', dbRes.status, t);
-      return res.status(500).json({ error: 'Erro ao buscar contrato', detail: t });
+      const rows = await dbRes.json();
+      if (!rows.length) return res.status(404).json({ error: 'Contrato não encontrado' });
+      contract = rows[0];
+    } catch (err) {
+      return res.status(500).json({ error: 'Erro de rede ao buscar contrato', detail: err.message });
     }
-    const rows = await dbRes.json();
-    if (!rows.length) return res.status(404).json({ error: 'Contrato não encontrado' });
-    contract = rows[0];
-    console.log('[generate-pdf] Contrato:', contract.razao_social);
-  } catch (err) {
-    console.error('[generate-pdf] Erro de rede DB:', err.message);
-    return res.status(500).json({ error: 'Erro de rede ao buscar contrato', detail: err.message });
+
+    const now = new Date();
+    templateData = {
+      NOME_CLIENTE:        contract.razao_social || '',
+      ENDERECO_CLIENTE:    contract.endereco || '',
+      CNPJ_CLIENTE:        contract.cnpj_cpf || '',
+      REPRESENTANTE_LEGAL: contract.representante_legal || '',
+      CPF_REPRESENTANTE:   contract.cpf_representante || '',
+      VALOR_HONORARIOS:    fmtBRL(contract.valor_honorario),
+      DATA_INICIO:         fmtDate(now),
+      SISTEMA_TRIBUTACAO:  contract.regime_tributario || '',
+      QTD_EMPREGADOS:      String(contract.qtd_empregados || ''),
+      QTD_PRO_LABORE:      String(contract.qtd_pro_labore || ''),
+      FATURAMENTO:         String(contract.faturamento_limite || ''),
+      QTD_NFE:             String(contract.qtd_nfe_mes ?? ''),
+      QTD_LANCAMENTOS:     '0',
+      COMPETENCIA_INICIO:  fmtMonthYear(now),
+      DATA_ASSINATURA:     fmtDateExtenso(now),
+    };
+    pdfSafeName = (contract.razao_social || 'contrato').replace(/[^a-zA-Z0-9_\-]/g, '_');
   }
 
-  // 2. Baixa template do Storage
+  // Baixa template do Storage
   console.log('[generate-pdf] Baixando template...');
   let templateBuffer;
   try {
@@ -116,30 +129,10 @@ app.post('/generate-pdf', async (req, res) => {
     templateBuffer = Buffer.from(await tRes.arrayBuffer());
     console.log('[generate-pdf] Template:', templateBuffer.length, 'bytes');
   } catch (err) {
-    console.error('[generate-pdf] Erro de rede template:', err.message);
     return res.status(500).json({ error: 'Erro de rede ao baixar template', detail: err.message });
   }
 
-  // 3. Preenche template com docxtemplater
-  const now = new Date();
-  const data = {
-    NOME_CLIENTE:        contract.razao_social || '',
-    ENDERECO_CLIENTE:    contract.endereco || '',
-    CNPJ_CLIENTE:        contract.cnpj_cpf || '',
-    REPRESENTANTE_LEGAL: contract.representante_legal || '',
-    CPF_REPRESENTANTE:   contract.cpf_representante || '',
-    VALOR_HONORARIOS:    fmtBRL(contract.valor_honorario),
-    DATA_INICIO:         fmtDate(now),
-    SISTEMA_TRIBUTACAO:  contract.regime_tributario || '',
-    QTD_EMPREGADOS:      String(contract.qtd_empregados || ''),
-    QTD_PRO_LABORE:      String(contract.qtd_pro_labore || ''),
-    FATURAMENTO:         String(contract.faturamento_limite || ''),
-    QTD_NFE:             String(contract.qtd_nfe_mes ?? ''),
-    QTD_LANCAMENTOS:     '0',
-    COMPETENCIA_INICIO:  fmtMonthYear(now),
-    DATA_ASSINATURA:     fmtDateExtenso(now),
-  };
-
+  // Preenche template com docxtemplater
   let filledDocx;
   try {
     const zip = new PizZip(templateBuffer);
@@ -149,7 +142,7 @@ app.post('/generate-pdf', async (req, res) => {
       linebreaks: true,
       nullGetter: () => '',
     });
-    doc.render(data);
+    doc.render(templateData);
     filledDocx = doc.getZip().generate({ type: 'nodebuffer' });
     console.log('[generate-pdf] DOCX preenchido:', filledDocx.length, 'bytes');
     fs.writeFileSync('/tmp/ultimo-gerado.docx', filledDocx);
@@ -158,14 +151,14 @@ app.post('/generate-pdf', async (req, res) => {
     return res.status(500).json({ error: 'Erro ao preencher template', detail: err.message, properties: err.properties });
   }
 
-  // 4. Converte com LibreOffice
+  // Converte com LibreOffice
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'genpdf-'));
   const inputPath = path.join(tmpDir, 'input.docx');
   const outputPath = path.join(tmpDir, 'input.pdf');
   try {
     fs.writeFileSync(inputPath, filledDocx);
     const stdout = execSync(
-      'libreoffice --headless --norestore --nofirststartwizard -env:UserInstallation=file://' + tmpDir + '/lo-profile --convert-to pdf --outdir ' + tmpDir + ' ' + inputPath,
+      `libreoffice --headless --norestore --nofirststartwizard -env:UserInstallation=file://${tmpDir}/lo-profile --convert-to pdf --outdir ${tmpDir} ${inputPath}`,
       { timeout: 60000, stdio: 'pipe' }
     );
     console.log('[generate-pdf] libreoffice stdout:', stdout?.toString());
@@ -175,13 +168,11 @@ app.post('/generate-pdf', async (req, res) => {
       return res.status(500).json({ error: 'Conversao falhou', stdout: stdout?.toString(), files: tmpFiles });
     }
     const pdfBuffer = fs.readFileSync(outputPath);
-    const safeName = (contract.razao_social || 'contrato').replace(/[^a-zA-Z0-9_\-]/g, '_');
-    res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': `attachment; filename="contrato_${safeName}.pdf"` });
+    const filename = `contrato_${pdfSafeName || 'contrato'}.pdf`;
+    res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': `attachment; filename="${filename}"` });
     res.send(pdfBuffer);
   } catch (err) {
-    console.error('[generate-pdf] ERRO LibreOffice:', err.message);
-    console.error('[generate-pdf] stderr:', err.stderr?.toString());
-    console.error('[generate-pdf] stdout:', err.stdout?.toString());
+    console.error('[generate-pdf] ERRO LibreOffice:', err.message, err.stderr?.toString());
     res.status(500).json({ error: 'Conversao falhou', detail: err.message, stderr: err.stderr?.toString() });
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
